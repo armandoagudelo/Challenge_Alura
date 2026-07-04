@@ -1,24 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Agente de RAG + Triaje con Claude (Anthropic), pensado para correr en consola.
+Agente de RAG + Triaje con Claude (Anthropic)
+
+Primera versión = Consolda, basado en el curso RAG y agentes de AI de Alura Latam (2024).
 
 Adaptado desde un notebook de Colab que usaba Gemini. Cambios principales:
-- Se quitaron los `!pip install` y el acceso a `google.colab.userdata`
-  (eso solo funciona dentro de Colab).
 - El LLM ahora es Claude (ChatAnthropic) en vez de Gemini.
 - Anthropic no ofrece API de embeddings, así que los embeddings para el
-  RAG se generan localmente con un modelo de HuggingFace
-  (sentence-transformers), sin costo ni API key adicional.
-- Los PDFs ya no se leen de /content/ (eso es una carpeta de Colab), sino
-  de una carpeta local "./docs" (configurable).
-- Se armó un loop de consola para poder chatear con el agente.
-
-Antes de correrlo:
-1. pip install -r requirements.txt
-2. Crear un archivo .env (junto a este script) con:
-       ANTHROPIC_API_KEY=sk-ant-...
-3. Poner tus PDFs dentro de la carpeta ./docs
-4. python rag_agent.py
+  RAG se generan localmente con un modelo FastEmbedEmbeddings (model_name="sentence-transformers/all-MiniLM-L6-v2")
+- Los PDFs ya no se leen de una carpeta local "./docs" (configurable).
+- Consola para poder chatear con el agente.
 """
 
 import os
@@ -34,8 +25,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_community.embeddings import FastEmbedEmbeddings
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langgraph.graph import START, END, StateGraph
 
 
@@ -55,16 +46,14 @@ if not ANTHROPIC_API_KEY:
     )
 
 CARPETA_DOCUMENTOS = Path(os.getenv("CARPETA_DOCUMENTOS", RAIZ_PROYECTO / "docs"))
-MODELO_CLAUDE = os.getenv("MODELO_CLAUDE", "claude-sonnet-5")
+MODELO_CLAUDE = os.getenv("MODELO_CLAUDE", "claude-haiku-4-5-20251001")
 
-# Modelo de LLM (Claude). temperature=0 para respuestas consistentes.
+# Modelo de LLM (Claude).
 llm = ChatAnthropic(
     model=MODELO_CLAUDE,
-    temperature=0,
     max_retries=2,
     api_key=ANTHROPIC_API_KEY,
 )
-
 
 # ---------------------------------------------------------------------------
 # Triaje: clasifica el mensaje del usuario
@@ -88,7 +77,6 @@ Reglas:
   (Ej.: "Quiero una excepción para trabajar remotamente durante 5 días").
 Analiza el mensaje y decide la acción más adecuada.
 """
-
 
 class TriajeOut(BaseModel):
     decision: Literal["AUTO_RESOLVER", "PEDIR_INFO", "ABRIR_TICKET"]
@@ -139,7 +127,7 @@ chunks = splitter.split_documents(docs) if docs else []
 
 # Embeddings locales (no requieren API key). El modelo se descarga una sola
 # vez la primera vez que se corre el script.
-modelo_embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+modelo_embeddings = FastEmbedEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 retriever = None
 if chunks:
