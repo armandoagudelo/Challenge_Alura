@@ -1,0 +1,12 @@
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+langchain-anthropic
+langchain-huggingface
+langgraph
+sentence-transformers
+faiss-cpu
+pymupdf
+pydantic
+python-dotenv
