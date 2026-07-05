@@ -12,10 +12,12 @@ Adaptado desde un notebook de Colab que usaba Gemini. Cambios principales:
 - Consola para poder chatear con el agente.
 """
 
+import logging
+import operator
 import os
 import re
 from pathlib import Path
-from typing import Literal, List, Dict, Optional, TypedDict
+from typing import Annotated, Literal, List, Dict, Optional, TypedDict
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -28,7 +30,10 @@ from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, END, StateGraph
+
+logger = logging.getLogger("vidaplus_rag")
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +44,16 @@ RAIZ_PROYECTO = Path(__file__).resolve().parent.parent  # carpeta que contiene s
 
 load_dotenv(RAIZ_PROYECTO / ".env")  # lee el .env de la raíz del proyecto
 
+# Log del detalle de citaciones (ver mostrar_respuesta): va a un archivo, no a
+# la consola, para que la consola muestre solo la respuesta al usuario.
+CARPETA_LOGS = RAIZ_PROYECTO / "logs"
+CARPETA_LOGS.mkdir(exist_ok=True)
+logging.basicConfig(
+    filename=CARPETA_LOGS / "rag.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY:
     raise RuntimeError(
@@ -48,6 +63,14 @@ if not ANTHROPIC_API_KEY:
 
 CARPETA_DOCUMENTOS = Path(os.getenv("CARPETA_DOCUMENTOS", RAIZ_PROYECTO / "docs"))
 MODELO_CLAUDE = os.getenv("MODELO_CLAUDE", "claude-haiku-4-5-20251001")
+
+# Canales de contacto humano para los casos que el agente no puede resolver.
+TELEFONO_CONTACTO = "+57 315 900 00 00"
+CORREO_CONTACTO = "droguerias.vidaplus@gmail.com"
+
+# thread_id fijo para el loop de consola (memoria entre preguntas). Un
+# frontend real debería generar uno único por sesión de usuario.
+SESSION_ID = "sesion-consola"
 
 # Modelo de LLM (Claude).
 llm = ChatAnthropic(
@@ -65,7 +88,7 @@ Eres un especialista en triaje del Service Desk de atención al cliente de Drogu
 VidaPlus (una cadena de droguerías en Armenia, Quindío).
 Dado el mensaje del usuario, devuelve SÓLO un JSON con:
 {
-    "decision": "AUTO_RESOLVER" | "PEDIR_INFO" | "ABRIR_TICKET",
+    "decision": "AUTO_RESOLVER" | "PEDIR_INFO" | "DERIVAR_CONTACTO",
     "urgencia": "BAJA" | "MEDIANA" | "ALTA",
     "campos_faltantes": ["..."]
 }
@@ -104,8 +127,9 @@ Reglas:
   - "Necesito ayuda."
   - "Tengo un problema con mi pedido." (no dice cuál problema ni con qué tema se relaciona)
   - "¿Me pueden colaborar?"
-- ABRIR_TICKET: Solicitudes de excepciones, autorización especial, quejas formales que
-  requieren intervención humana, o cuando el usuario pide explícitamente abrir un ticket.
+- DERIVAR_CONTACTO: Solicitudes de excepciones, autorización especial, quejas formales que
+  requieren intervención humana, o cuando el usuario pide explícitamente hablar con una
+  persona o radicar un reclamo.
   Ejemplos:
   - "Quiero una autorización especial para devolver un medicamento fuera de los plazos."
   - "Quiero radicar una queja formal por un domiciliario."
@@ -117,7 +141,7 @@ Analiza el mensaje y decide la acción más adecuada.
 """
 
 class TriajeOut(BaseModel):
-    decision: Literal["AUTO_RESOLVER", "PEDIR_INFO", "ABRIR_TICKET"]
+    decision: Literal["AUTO_RESOLVER", "PEDIR_INFO", "DERIVAR_CONTACTO"]
     urgencia: Literal["BAJA", "MEDIANA", "ALTA"]
     campos_faltantes: List[str] = Field(default_factory=list)
 
@@ -140,10 +164,8 @@ def triaje(mensaje: str) -> Dict:
 # ---------------------------------------------------------------------------
 
 def limpiar_texto(texto: str) -> str:
-    # PyMuPDF deja espacios de ancho cero ("​") pegados a las viñetas y
-    # múltiples saltos de línea que fragmentan las oraciones. Un modelo de
-    # embeddings local y pequeño como MiniLM es sensible a este ruido: lo
-    # limpiamos antes de indexar para mejorar la calidad de la búsqueda.
+    """Quita ruido de la extracción de PDF (espacios de ancho cero, viñetas,
+    saltos de línea repetidos) que degrada la calidad de los embeddings."""
     texto = texto.replace("​", " ")
     texto = re.sub(r"●\s*", "- ", texto)
     texto = re.sub(r"[ \t]+", " ", texto)
@@ -178,13 +200,9 @@ docs = cargar_documentos(CARPETA_DOCUMENTOS)
 splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
 chunks = splitter.split_documents(docs) if docs else []
 
-# Embeddings locales (no requieren API key). El modelo se descarga una sola
-# vez la primera vez que se corre el script.
-# Se usa un modelo multilingüe (no el MiniLM en inglés) porque los documentos
-# y las preguntas están en español: un modelo entrenado solo en inglés genera
-# embeddings de baja calidad para texto en español, lo que hace que el
-# retriever no encuentre los fragmentos correctos aunque el chunking sea
-# bueno. Este modelo sigue siendo gratuito, local y liviano (~220 MB).
+# Embeddings locales, gratuitos. Modelo multilingüe (no el MiniLM en inglés):
+# los documentos y preguntas están en español, y un modelo solo-inglés da
+# embeddings de baja calidad para ese idioma.
 modelo_embeddings = FastEmbedEmbeddings(
     model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
@@ -192,10 +210,8 @@ modelo_embeddings = FastEmbedEmbeddings(
 retriever = None
 if chunks:
     vectorstore = FAISS.from_documents(chunks, modelo_embeddings)
-    # "similarity" en vez de "similarity_score_threshold": con un modelo local
-    # pequeño como MiniLM los puntajes de similitud no están bien calibrados
-    # entre preguntas distintas, así que un umbral fijo descarta respuestas
-    # válidas o deja pasar coincidencias débiles. Top-k puro es más confiable.
+    # "similarity" (top-k) en vez de "similarity_score_threshold": con MiniLM
+    # los puntajes no están bien calibrados entre preguntas distintas.
     retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": 6},
@@ -218,6 +234,35 @@ prompt_rag = ChatPromptTemplate(
 document_chain = create_stuff_documents_chain(llm, prompt_rag)
 
 
+class RelevanciaOut(BaseModel):
+    documentos_suficientes: bool
+
+
+PROMPT_RELEVANCIA = """
+Eres un evaluador de calidad para un sistema de RAG. Dada una pregunta de un cliente y
+los fragmentos de documentos recuperados, decide si esos fragmentos contienen información
+suficiente para responder la pregunta de forma concreta.
+Responde "documentos_suficientes": true solo si de verdad se puede construir una respuesta
+útil con ese contenido; si los fragmentos son irrelevantes o solo mencionan el tema de
+pasada sin responderlo, responde false.
+"""
+
+chain_relevancia = llm.with_structured_output(RelevanciaOut)
+
+
+def calificar_relevancia(pregunta: str, documentos: list) -> bool:
+    """Reemplaza el chequeo frágil de comparar la respuesta generada contra el
+    string literal "No lo sé"."""
+    contexto = "\n\n".join(doc.page_content for doc in documentos)
+    salida: RelevanciaOut = chain_relevancia.invoke(
+        [
+            SystemMessage(content=PROMPT_RELEVANCIA),
+            HumanMessage(content=f"Pregunta: {pregunta}\n\nFragmentos recuperados:\n{contexto}"),
+        ]
+    )
+    return salida.documentos_suficientes
+
+
 def busqueda_de_respuestas_RAG(pregunta: str) -> Dict:
     if retriever is None:
         return {"respuesta": "No lo sé", "citaciones": [], "documentos_encontrados": False}
@@ -227,10 +272,10 @@ def busqueda_de_respuestas_RAG(pregunta: str) -> Dict:
     if not documentos_relacionados:
         return {"respuesta": "No lo sé", "citaciones": [], "documentos_encontrados": False}
 
-    answer = document_chain.invoke({"input": pregunta, "context": documentos_relacionados})
-
-    if answer.rstrip(".!?") == "No lo sé":
+    if not calificar_relevancia(pregunta, documentos_relacionados):
         return {"respuesta": "No lo sé", "citaciones": [], "documentos_encontrados": False}
+
+    answer = document_chain.invoke({"input": pregunta, "context": documentos_relacionados})
 
     return {
         "respuesta": answer,
@@ -240,25 +285,72 @@ def busqueda_de_respuestas_RAG(pregunta: str) -> Dict:
 
 
 # ---------------------------------------------------------------------------
-# Agente con LangGraph: triaje -> auto_resolver / pedir_info / abrir_ticket
+# Agente con LangGraph:
+# contextualizar -> triaje -> auto_resolver / pedir_info / derivar_contacto -> finalizar
 # ---------------------------------------------------------------------------
 
 class AgentState(TypedDict, total=False):
     pregunta: str
+    pregunta_efectiva: str
     triaje: dict
     respuesta: Optional[str]
     citaciones: Optional[list]
     documentos_encontrados: Optional[bool]
+    documentos_consultados: List[str]
     rag_exito: bool
     accion_final: str
+    info_por_rag_insuficiente: bool  # ver nodo_pedir_info
+    historial: Annotated[List[Dict[str, str]], operator.add]  # ver nodo_finalizar
+
+
+PROMPT_CONTEXTUALIZAR = """
+Eres un asistente que reformula preguntas de seguimiento para que se puedan entender por sí
+solas, sin necesitar el historial de la conversación.
+Dado el historial de turnos anteriores y el mensaje nuevo del usuario, devuelve una única
+pregunta autónoma que capture la intención real del usuario, incorporando el contexto
+necesario del historial (por ejemplo, el tema o la zona mencionados antes) SOLO cuando el
+mensaje nuevo realmente depende de ese contexto para entenderse.
+Si el mensaje nuevo ya es autónomo y no depende del historial, devuélvelo tal cual, sin
+agregar ni quitar información.
+Si el mensaje nuevo es un saludo, una despedida, un agradecimiento, o cualquier mensaje
+neutro que no tenga relación con el historial (ej. "hola", "gracias", "listo"), devuélvelo
+tal cual. NUNCA lo reemplaces por una pregunta anterior del historial: un saludo no es una
+pregunta de seguimiento.
+Responde ÚNICAMENTE con el mensaje resultante, sin explicaciones adicionales.
+"""
+
+
+def nodo_contextualizar(state: AgentState) -> AgentState:
+    """Reformula la pregunta usando el historial y reinicia info_por_rag_insuficiente
+    (si no se resetea, un campo no reescrito en el turno actual conserva el valor
+    persistido del turno anterior)."""
+    historial = state.get("historial") or []
+    if not historial:
+        return {"pregunta_efectiva": state["pregunta"], "info_por_rag_insuficiente": False}
+
+    texto_historial = "\n".join(
+        f"Usuario: {turno['pregunta']}\nAsistente: {turno['respuesta']}" for turno in historial
+    )
+    respuesta = llm.invoke(
+        [
+            SystemMessage(content=PROMPT_CONTEXTUALIZAR),
+            HumanMessage(
+                content=f"Historial:\n{texto_historial}\n\nPregunta nueva: {state['pregunta']}"
+            ),
+        ]
+    )
+    return {
+        "pregunta_efectiva": respuesta.content.strip(),
+        "info_por_rag_insuficiente": False,
+    }
 
 
 def nodo_triaje(state: AgentState) -> AgentState:
-    return {"triaje": triaje(state["pregunta"])}
+    return {"triaje": triaje(state["pregunta_efectiva"])}
 
 
 def nodo_auto_resolver(state: AgentState) -> AgentState:
-    respuesta_RAG = busqueda_de_respuestas_RAG(state["pregunta"])
+    respuesta_RAG = busqueda_de_respuestas_RAG(state["pregunta_efectiva"])
 
     update: AgentState = {
         "respuesta": respuesta_RAG["respuesta"],
@@ -266,24 +358,57 @@ def nodo_auto_resolver(state: AgentState) -> AgentState:
         "rag_exito": respuesta_RAG["documentos_encontrados"],
     }
 
-    update["accion_final"] = "AUTO_RESOLVER" if respuesta_RAG["documentos_encontrados"] else "pedir_info"
+    update["accion_final"] = "AUTO_RESOLVER" if respuesta_RAG["documentos_encontrados"] else "PEDIR_INFO"
+    if not respuesta_RAG["documentos_encontrados"]:
+        update["info_por_rag_insuficiente"] = True
     return update
 
 
 def nodo_pedir_info(state: AgentState) -> AgentState:
+    """Mensaje distinto según el origen: RAG sin resultados vs. triaje ambiguo."""
+    if state.get("info_por_rag_insuficiente"):
+        mensaje = "No encontré información específica sobre eso en nuestras políticas."
+    else:
+        mensaje = (
+            "Cuéntame en qué puedo ayudarte: domicilios, promociones y descuentos, el "
+            "Programa Cliente VidaPlus, cambios/reembolsos/garantías, o el tratamiento de "
+            "tus datos personales."
+        )
+
     return {
-        "respuesta": "Necesito más información sobre tu pedido.",
+        "respuesta": mensaje,
         "citaciones": [],
         "accion_final": "PEDIR_INFO",
     }
 
 
-def nodo_abrir_ticket(state: AgentState) -> AgentState:
+def nodo_derivar_contacto(state: AgentState) -> AgentState:
+    """Deriva a un agente humano (no crea ningún ticket real)."""
     tri = state["triaje"]
+    mensaje = (
+        f"Esta solicitud (urgencia {tri['urgencia']}) requiere la atención de un agente "
+        "humano. Por favor contáctanos directamente:\n"
+        f"📞 Teléfono / WhatsApp: {TELEFONO_CONTACTO}\n"
+        f"📧 Correo: {CORREO_CONTACTO}\n"
+        "Con gusto te atenderemos personalmente."
+    )
     return {
-        "respuesta": f"Abrir ticket con urgencia {tri['urgencia']}. Pedido: {state['pregunta']}.",
+        "respuesta": mensaje,
         "citaciones": [],
-        "accion_final": "ABRIR_TICKET",
+        "accion_final": "DERIVAR_CONTACTO",
+    }
+
+
+def nodo_finalizar(state: AgentState) -> AgentState:
+    """Punto único antes de END: guarda el turno en el historial y arma el
+    resumen de documentos consultados."""
+    citaciones = state.get("citaciones") or []
+    documentos = sorted({
+        Path(c.metadata.get("file_path", "desconocido")).name for c in citaciones
+    })
+    return {
+        "documentos_consultados": documentos,
+        "historial": [{"pregunta": state["pregunta"], "respuesta": state["respuesta"]}],
     }
 
 
@@ -294,10 +419,10 @@ def arista_decision_triaje(state: AgentState) -> str:
     elif tri["decision"] == "PEDIR_INFO":
         return "info"
     else:
-        return "ticket"
+        return "contacto"
 
 
-KEYWORDS_ABRIR_TICKET = [
+KEYWORDS_DERIVAR_CONTACTO = [
     "aprobación", "aprobar", "excepción", "liberación", "autorización",
     "autorizar", "abrir ticket", "acceso especial",
 ]
@@ -306,53 +431,78 @@ KEYWORDS_ABRIR_TICKET = [
 def arista_decision_rag(state: AgentState) -> str:
     if state["rag_exito"]:
         return "ok"
-    if any(keyword in state["pregunta"].lower() for keyword in KEYWORDS_ABRIR_TICKET):
-        return "ticket"
+    if any(keyword in state["pregunta_efectiva"].lower() for keyword in KEYWORDS_DERIVAR_CONTACTO):
+        return "contacto"
     return "info"
 
 
 def construir_grafo():
     workflow = StateGraph(AgentState)
 
+    workflow.add_node("contextualizar", nodo_contextualizar)
     workflow.add_node("triaje", nodo_triaje)
     workflow.add_node("auto_resolver", nodo_auto_resolver)
     workflow.add_node("pedir_info", nodo_pedir_info)
-    workflow.add_node("abrir_ticket", nodo_abrir_ticket)
+    workflow.add_node("derivar_contacto", nodo_derivar_contacto)
+    workflow.add_node("finalizar", nodo_finalizar)
 
-    workflow.add_edge(START, "triaje")
+    workflow.add_edge(START, "contextualizar")
+    workflow.add_edge("contextualizar", "triaje")
 
     workflow.add_conditional_edges(
         "triaje",
         arista_decision_triaje,
-        {"rag": "auto_resolver", "info": "pedir_info", "ticket": "abrir_ticket"},
+        {"rag": "auto_resolver", "info": "pedir_info", "contacto": "derivar_contacto"},
     )
 
     workflow.add_conditional_edges(
         "auto_resolver",
         arista_decision_rag,
-        {"info": "pedir_info", "ticket": "abrir_ticket", "ok": END},
+        {"info": "pedir_info", "contacto": "derivar_contacto", "ok": "finalizar"},
     )
 
-    workflow.add_edge("pedir_info", END)
-    workflow.add_edge("abrir_ticket", END)
+    workflow.add_edge("pedir_info", "finalizar")
+    workflow.add_edge("derivar_contacto", "finalizar")
+    workflow.add_edge("finalizar", END)
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=MemorySaver())
 
 
 grafo = construir_grafo()
 
 
 def mostrar_respuesta(resultado: Dict):
+    """Consola de cara al usuario: solo respuesta + documentos consultados,
+    en secciones separadas. El detalle de triaje y el contenido crudo de las
+    citaciones se registran en logs/rag.log, no se imprimen aquí."""
     tri = resultado["triaje"]
-    print(f"DECISION: {tri['decision']} | URGENCIA: {tri['urgencia']} | FALTANTES: {tri['campos_faltantes']}")
-    print(f"RESPUESTA: {resultado['respuesta']}")
+    logger.info(
+        "Triaje | decision=%s urgencia=%s faltantes=%s",
+        tri["decision"], tri["urgencia"], tri["campos_faltantes"],
+    )
+    for i, citacion in enumerate(resultado.get("citaciones") or []):
+        logger.info(
+            "Citación %d | Documento: %s | Contenido: %s",
+            i + 1,
+            citacion.metadata.get("file_path", "desconocido"),
+            citacion.page_content.replace("\n", " "),
+        )
 
-    citaciones = resultado.get("citaciones") or []
-    for i, citacion in enumerate(citaciones):
-        contenido = citacion.page_content.replace("\n", " ")
-        print(f"  - CITACION {i + 1}:")
-        print(f"    Documento: {citacion.metadata.get('file_path', 'desconocido')}")
-        print(f"    Contenido: {contenido}")
+    separador = "-" * 60
+    print(separador)
+    print("RESPUESTA")
+    print(separador)
+    print(resultado["respuesta"])
+
+    documentos_consultados = resultado.get("documentos_consultados") or []
+    if documentos_consultados:
+        print()
+        print(separador)
+        print("DOCUMENTOS CONSULTADOS")
+        print(separador)
+        for nombre in documentos_consultados:
+            print(f"- {nombre}")
+    print(separador)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +514,8 @@ def main():
     print(f"Carpeta de documentos: {CARPETA_DOCUMENTOS.resolve()}")
     print("Escribe tu pregunta (o 'salir' para terminar).\n")
 
+    config = {"configurable": {"thread_id": SESSION_ID}}
+
     while True:
         pregunta = input("Tú: ").strip()
         if not pregunta:
@@ -372,7 +524,7 @@ def main():
             print("Hasta luego.")
             break
 
-        resultado = grafo.invoke({"pregunta": pregunta})
+        resultado = grafo.invoke({"pregunta": pregunta}, config=config)
         mostrar_respuesta(resultado)
         print()
 
