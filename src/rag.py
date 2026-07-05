@@ -13,6 +13,7 @@ Adaptado desde un notebook de Colab que usaba Gemini. Cambios principales:
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Literal, List, Dict, Optional, TypedDict
 
@@ -60,21 +61,58 @@ llm = ChatAnthropic(
 # ---------------------------------------------------------------------------
 
 PROMPT_TRIAJE = """
-Eres un especialista en triaje del Service Desk para políticas internas.
+Eres un especialista en triaje del Service Desk de atención al cliente de Droguerías
+VidaPlus (una cadena de droguerías en Armenia, Quindío).
 Dado el mensaje del usuario, devuelve SÓLO un JSON con:
 {
     "decision": "AUTO_RESOLVER" | "PEDIR_INFO" | "ABRIR_TICKET",
     "urgencia": "BAJA" | "MEDIANA" | "ALTA",
     "campos_faltantes": ["..."]
 }
+
+La base de conocimiento de la empresa cubre estos documentos y temas:
+- Manual Corporativo: sedes, horarios, medios de pago, convenios, servicios generales.
+- Política de Domicilios: cobertura, horarios, tiempos y costos de entrega, medicamentos
+  con fórmula médica a domicilio, entregas fallidas, productos faltantes.
+- Manual de Promociones y Descuentos: calendario semanal de descuentos, condiciones de
+  acumulación, exclusiones.
+- Programa Cliente VidaPlus: planes de afiliación (Esencial, Plus, Premium), puntos,
+  beneficios, domicilio gratuito.
+- Política de Cambios, Reembolsos y Garantías: devoluciones, productos que no admiten
+  cambio, garantías por defecto de fabricación, tiempos de reembolso.
+- Política de Tratamiento de Datos Personales: privacidad, derechos del titular,
+  comunicaciones comerciales, cómo dejar de recibir promociones.
+
 Reglas:
-- AUTO_RESOLVER: Preguntas claras sobre las reglas o procedimientos descritos en las políticas
-  (Ej.: "¿Puedo reembolsar el internet para mi oficina en casa?").
-- PEDIR_INFO: Mensajes imprecisos o sin información para identificar el tema o el contexto
-  (Ej.: "Necesito ayuda con una política").
-- ABRIR_TICKET: Solicitudes de excepciones, autorización, aprobación o acceso especial, o
-  cuando el usuario solicita explícitamente abrir un ticket
-  (Ej.: "Quiero una excepción para trabajar remotamente durante 5 días").
+- AUTO_RESOLVER: Cualquier pregunta identificable dentro de alguno de los temas anteriores,
+  aunque esté formulada de manera general o coloquial. No necesitas saber de antemano si el
+  documento contiene la respuesta exacta: basta con que el tema sea reconocible para que el
+  sistema de búsqueda (RAG) lo intente resolver.
+  Ejemplos reales de clientes que SÍ son AUTO_RESOLVER:
+  - "¿Cuánto cuesta un domicilio?" (tema: Política de Domicilios)
+  - "¿En qué zonas de Armenia realizan domicilios?" (tema: Política de Domicilios)
+  - "¿Puedo solicitar medicamentos con fórmula médica a domicilio?" (tema: Política de
+    Domicilios)
+  - "¿Cómo puedo dejar de recibir promociones por correo o teléfono?" (tema: Tratamiento de
+    Datos Personales / comunicaciones comerciales)
+  - "¿Puedo devolver un medicamento que ya abrí?" (tema: Cambios, Reembolsos y Garantías)
+  - "¿Qué beneficios tiene el Plan Vida Premium?" (tema: Programa Cliente VidaPlus)
+  - "¿Qué promoción hay los jueves?" (tema: Promociones y Descuentos)
+- PEDIR_INFO: Únicamente cuando el mensaje sea tan ambiguo que no se pueda relacionar con
+  NINGUNO de los temas anteriores, ni siquiera de forma general.
+  Ejemplos:
+  - "Necesito ayuda."
+  - "Tengo un problema con mi pedido." (no dice cuál problema ni con qué tema se relaciona)
+  - "¿Me pueden colaborar?"
+- ABRIR_TICKET: Solicitudes de excepciones, autorización especial, quejas formales que
+  requieren intervención humana, o cuando el usuario pide explícitamente abrir un ticket.
+  Ejemplos:
+  - "Quiero una autorización especial para devolver un medicamento fuera de los plazos."
+  - "Quiero radicar una queja formal por un domiciliario."
+
+Ante la duda entre AUTO_RESOLVER y PEDIR_INFO, prefiere AUTO_RESOLVER: es mejor dejar que
+el sistema busque en las políticas y responda "No lo sé" si no encuentra nada, que pedirle
+información adicional a un cliente cuya pregunta ya es identificable.
 Analiza el mensaje y decide la acción más adecuada.
 """
 
@@ -101,6 +139,18 @@ def triaje(mensaje: str) -> Dict:
 # RAG: carga de documentos, embeddings, vectorstore y búsqueda
 # ---------------------------------------------------------------------------
 
+def limpiar_texto(texto: str) -> str:
+    # PyMuPDF deja espacios de ancho cero ("​") pegados a las viñetas y
+    # múltiples saltos de línea que fragmentan las oraciones. Un modelo de
+    # embeddings local y pequeño como MiniLM es sensible a este ruido: lo
+    # limpiamos antes de indexar para mejorar la calidad de la búsqueda.
+    texto = texto.replace("​", " ")
+    texto = re.sub(r"●\s*", "- ", texto)
+    texto = re.sub(r"[ \t]+", " ", texto)
+    texto = re.sub(r"\n{2,}", "\n\n", texto)
+    return texto.strip()
+
+
 def cargar_documentos(carpeta: Path):
     docs = []
     if not carpeta.exists():
@@ -111,7 +161,10 @@ def cargar_documentos(carpeta: Path):
     for archivo in carpeta.glob("*.pdf"):
         try:
             loader = PyMuPDFLoader(str(archivo))
-            docs.extend(loader.load())
+            documentos_archivo = loader.load()
+            for doc in documentos_archivo:
+                doc.page_content = limpiar_texto(doc.page_content)
+            docs.extend(documentos_archivo)
             print(f"Archivo cargado: {archivo.name}")
         except Exception as e:
             print(f"Error cargando archivo {archivo.name}: {e}")
@@ -122,19 +175,30 @@ def cargar_documentos(carpeta: Path):
 
 docs = cargar_documentos(CARPETA_DOCUMENTOS)
 
-splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30)
+splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
 chunks = splitter.split_documents(docs) if docs else []
 
 # Embeddings locales (no requieren API key). El modelo se descarga una sola
 # vez la primera vez que se corre el script.
-modelo_embeddings = FastEmbedEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# Se usa un modelo multilingüe (no el MiniLM en inglés) porque los documentos
+# y las preguntas están en español: un modelo entrenado solo en inglés genera
+# embeddings de baja calidad para texto en español, lo que hace que el
+# retriever no encuentre los fragmentos correctos aunque el chunking sea
+# bueno. Este modelo sigue siendo gratuito, local y liviano (~220 MB).
+modelo_embeddings = FastEmbedEmbeddings(
+    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
 
 retriever = None
 if chunks:
     vectorstore = FAISS.from_documents(chunks, modelo_embeddings)
+    # "similarity" en vez de "similarity_score_threshold": con un modelo local
+    # pequeño como MiniLM los puntajes de similitud no están bien calibrados
+    # entre preguntas distintas, así que un umbral fijo descarta respuestas
+    # válidas o deja pasar coincidencias débiles. Top-k puro es más confiable.
     retriever = vectorstore.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"score_threshold": 0.3, "k": 4},
+        search_type="similarity",
+        search_kwargs={"k": 6},
     )
 else:
     print("No hay documentos para indexar todavía; el RAG responderá 'No lo sé' hasta que agregues PDFs.")
