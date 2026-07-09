@@ -19,6 +19,12 @@ El agente consulta los siguientes documentos (en `docs/`):
 - Preguntas Frecuentes (FAQ)
 - Glosario Corporativo
 
+### Interfaz
+
+La interacción con el agente se realiza a través de una interfaz de chat web construida con Streamlit:
+
+![Interfaz del asistente Droguerías VidaPlus](src/img/interfaz.jpg)
+
 ---
 
 ## Cómo Funciona el Grafo
@@ -63,6 +69,7 @@ flowchart TD
 ## Tecnologías y Herramientas Utilizadas
 
 - **Python**
+- **Streamlit** — interfaz de chat web (con soporte para cargar documentos nuevos en caliente y un "modo desarrollador" para inspeccionar el triaje)
 - **LangChain** / `langchain-anthropic` / `langchain-community` / `langchain-text-splitters` / `langchain-classic`
 - **LangGraph** (grafo de estados + memoria conversacional con `MemorySaver`)
 - **Claude (Anthropic)** como modelo de lenguaje (`ChatAnthropic`)
@@ -70,7 +77,7 @@ flowchart TD
 - **FAISS** — base de datos vectorial local
 - **PyMuPDF** — lectura de los PDFs de la base de conocimiento
 - **Pydantic** — validación y salidas estructuradas (triaje, calificación de relevancia)
-- **python-dotenv** — configuración vía variables de entorno
+- **python-dotenv** — configuración vía variables de entorno (local); `st.secrets` en el despliegue
 
 ---
 
