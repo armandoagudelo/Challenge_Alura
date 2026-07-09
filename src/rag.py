@@ -68,6 +68,11 @@ MODELO_CLAUDE = os.getenv("MODELO_CLAUDE", "claude-haiku-4-5-20251001")
 TELEFONO_CONTACTO = "+57 315 900 00 00"
 CORREO_CONTACTO = "droguerias.vidaplus@gmail.com"
 
+# Nombres de PDFs cargados en caliente por el usuario (ver
+# agregar_documentos_pdf). El triaje los suma a sus temas conocidos para no
+# clasificarlos como ambiguos.
+DOCUMENTOS_AGREGADOS: List[str] = []
+
 # thread_id fijo para el loop de consola (memoria entre preguntas). Un
 # frontend real debería generar uno único por sesión de usuario.
 SESSION_ID = "sesion-consola"
@@ -149,10 +154,21 @@ class TriajeOut(BaseModel):
 chain_triaje = llm.with_structured_output(TriajeOut)
 
 
+def _prompt_triaje() -> str:
+    if not DOCUMENTOS_AGREGADOS:
+        return PROMPT_TRIAJE
+    extra = "\n".join(f"- {n}" for n in DOCUMENTOS_AGREGADOS)
+    return (
+        PROMPT_TRIAJE
+        + "\nDocumentos adicionales cargados por el usuario (trátalos como temas válidos "
+        f"para AUTO_RESOLVER):\n{extra}\n"
+    )
+
+
 def triaje(mensaje: str) -> Dict:
     salida: TriajeOut = chain_triaje.invoke(
         [
-            SystemMessage(content=PROMPT_TRIAJE),
+            SystemMessage(content=_prompt_triaje()),
             HumanMessage(content=mensaje),
         ]
     )
@@ -207,17 +223,44 @@ modelo_embeddings = FastEmbedEmbeddings(
     model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
 
+# "similarity" (top-k) en vez de "similarity_score_threshold": con MiniLM
+# los puntajes no están bien calibrados entre preguntas distintas.
+RETRIEVER_KWARGS = {"search_type": "similarity", "search_kwargs": {"k": 6}}
+
+vectorstore = None
 retriever = None
 if chunks:
     vectorstore = FAISS.from_documents(chunks, modelo_embeddings)
-    # "similarity" (top-k) en vez de "similarity_score_threshold": con MiniLM
-    # los puntajes no están bien calibrados entre preguntas distintas.
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 6},
-    )
+    retriever = vectorstore.as_retriever(**RETRIEVER_KWARGS)
 else:
     print("No hay documentos para indexar todavía; el RAG responderá 'No lo sé' hasta que agregues PDFs.")
+
+
+def agregar_documentos_pdf(rutas) -> int:
+    """Indexa PDFs adicionales en caliente sobre el mismo vectorstore. Devuelve
+    cuántos fragmentos se agregaron."""
+    global vectorstore, retriever
+    nuevos_docs = []
+    nombres = []
+    for ruta in rutas:
+        docs_archivo = PyMuPDFLoader(str(ruta)).load()
+        for doc in docs_archivo:
+            doc.page_content = limpiar_texto(doc.page_content)
+        if docs_archivo:
+            nuevos_docs.extend(docs_archivo)
+            nombres.append(Path(ruta).name)
+
+    nuevos_chunks = splitter.split_documents(nuevos_docs) if nuevos_docs else []
+    if not nuevos_chunks:
+        return 0
+
+    if vectorstore is None:
+        vectorstore = FAISS.from_documents(nuevos_chunks, modelo_embeddings)
+        retriever = vectorstore.as_retriever(**RETRIEVER_KWARGS)
+    else:
+        vectorstore.add_documents(nuevos_chunks)
+    DOCUMENTOS_AGREGADOS.extend(nombres)
+    return len(nuevos_chunks)
 
 prompt_rag = ChatPromptTemplate(
     [
