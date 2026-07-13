@@ -8,6 +8,7 @@ Ejecutar con: streamlit run src/app.py
 import base64
 import os
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -34,6 +35,15 @@ except RuntimeError as e:
 
 RUTA_BANNER = Path(__file__).parent / "img" / "banner_web.jpg"
 EMOJIS_URGENCIA = {"BAJA": "🟢", "MEDIANA": "🟡", "ALTA": "🔴"}
+
+# Preguntas de arranque que se muestran solo con el chat vacío. Alineadas con los
+# temas que el triaje reconoce como AUTO_RESOLVER.
+PREGUNTAS_SUGERIDAS = [
+    "¿Cuánto cuesta un domicilio?",
+    "¿Qué promoción hay hoy?",
+    "¿Qué beneficios tiene el Plan Premium?",
+    "¿Puedo devolver un medicamento abierto?",
+]
 
 ESTILOS = """
 <style>
@@ -150,6 +160,27 @@ def render_accion_final(accion_final, respuesta):
         st.markdown(respuesta)
 
 
+def _stream_texto(texto: str):
+    """Cede la respuesta palabra por palabra para el efecto de escritura
+    progresiva con st.write_stream. Uniforme para los tres tipos de acción."""
+    for palabra in texto.split(" "):
+        yield palabra + " "
+        time.sleep(0.02)
+
+
+def render_accion_final_stream(accion_final, respuesta):
+    """Igual que render_accion_final pero con efecto streaming en el cuerpo.
+    Los avisos (info/warning) conservan su contenedor de color."""
+    if accion_final == "PEDIR_INFO":
+        with st.container(border=True):
+            st.write_stream(_stream_texto(respuesta))
+    elif accion_final == "DERIVAR_CONTACTO":
+        with st.container(border=True):
+            st.write_stream(_stream_texto(respuesta))
+    else:
+        st.write_stream(_stream_texto(respuesta))
+
+
 render_banner()
 
 if "thread_id" not in st.session_state:
@@ -201,6 +232,14 @@ with st.sidebar:
         st.session_state.thread_id = str(uuid.uuid4())
         st.rerun()
 
+    st.divider()
+    st.markdown("**¿Necesitas atención personal?**")
+    st.caption(f"📞 {rag.TELEFONO_CONTACTO}")
+    st.caption(f"📧 {rag.CORREO_CONTACTO}")
+
+    st.divider()
+    st.caption("Desarrollado por Armando Agudelo · Desplegado en Streamlit 🎈")
+
 for mensaje in st.session_state.messages:
     with st.chat_message(mensaje["role"]):
         if mensaje["role"] == "assistant":
@@ -211,8 +250,9 @@ for mensaje in st.session_state.messages:
         else:
             st.markdown(mensaje["content"])
 
-pregunta = st.chat_input("Escribe tu pregunta...")
-if pregunta:
+
+def procesar_pregunta(pregunta: str):
+    """Flujo común para una pregunta, venga del chat_input o de un chip."""
     st.session_state.messages.append({"role": "user", "content": pregunta})
     with st.chat_message("user"):
         st.markdown(pregunta)
@@ -222,7 +262,7 @@ if pregunta:
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
             resultado = rag.grafo.invoke({"pregunta": pregunta}, config=config)
 
-        render_accion_final(resultado["accion_final"], resultado["respuesta"])
+        render_accion_final_stream(resultado["accion_final"], resultado["respuesta"])
         if modo_desarrollador:
             render_triaje_badge(resultado.get("triaje"))
         render_documentos(resultado.get("documentos_consultados"))
@@ -236,3 +276,28 @@ if pregunta:
             "accion_final": resultado["accion_final"],
         }
     )
+
+
+# Preguntas sugeridas: solo al inicio, cuando aún no hay conversación.
+if not st.session_state.messages:
+    st.caption("Prueba con una de estas preguntas:")
+    columnas = st.columns(2)
+    for i, sugerida in enumerate(PREGUNTAS_SUGERIDAS):
+        if columnas[i % 2].button(sugerida, key=f"sugerida_{i}", use_container_width=True):
+            st.session_state.pregunta_pendiente = sugerida
+            st.rerun()
+
+pregunta = st.chat_input("Escribe tu pregunta...")
+
+# Un chip pulsado deja la pregunta aquí para procesarla tras el rerun.
+if not pregunta and st.session_state.get("pregunta_pendiente"):
+    pregunta = st.session_state.pop("pregunta_pendiente")
+
+if pregunta:
+    procesar_pregunta(pregunta)
+    # Refresca la interfaz tras responder: deja el estado consistente (oculta los
+    # chips de sugerencias una vez que ya hay conversación) y evita que queden
+    # botones "pegados" de un render anterior que no responderían al pulsarlos.
+    st.rerun()
+
+st.caption("🤖 Asistente virtual — puede cometer errores. Verifica la información importante.")

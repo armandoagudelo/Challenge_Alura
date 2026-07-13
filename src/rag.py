@@ -12,10 +12,12 @@ Adaptado desde un notebook de Colab que usaba Gemini. Cambios principales:
 - Consola para poder chatear con el agente.
 """
 
+import datetime
 import logging
 import operator
 import os
 import re
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Annotated, Literal, List, Dict, Optional, TypedDict
 
@@ -266,11 +268,11 @@ prompt_rag = ChatPromptTemplate(
     [
         (
             "system",
-            "Eres el especialista en RR.HH. de la empresa. "
+            "Eres el asistente virtual de atención al cliente de Droguerías VidaPlus. "
             "Responde siempre utilizando los conocimientos del contexto entregado. "
             "Si no hay información sobre la pregunta en el contexto, responde solo 'No lo sé'.",
         ),
-        ("human", "Contexto: {context}\nPregunta del empleado: {input}"),
+        ("human", "Contexto: {context}\nPregunta del cliente: {input}"),
     ]
 )
 
@@ -363,27 +365,57 @@ Responde ÚNICAMENTE con el mensaje resultante, sin explicaciones adicionales.
 """
 
 
+# Los documentos de promociones organizan la información por día de la semana, pero
+# el usuario suele preguntar "hoy" / "mañana". El agente no tiene noción del día, así
+# que resolvemos esas referencias a un día concreto antes de la búsqueda (RAG): de lo
+# contrario "hoy" no recupera el fragmento del día correcto y el evaluador de
+# relevancia descarta la respuesta.
+DIAS_SEMANA_ES = {
+    0: "lunes", 1: "martes", 2: "miércoles", 3: "jueves",
+    4: "viernes", 5: "sábado", 6: "domingo",
+}
+PALABRAS_FECHA_RELATIVA = ("hoy", "mañana", "ahora", "actualmente", "esta semana", "este día")
+
+# Zona horaria de la operación (Armenia, Colombia). Se usa para calcular el día
+# actual: el servidor de Streamlit Cloud corre en UTC y, sin esto, cerca de la
+# medianoche colombiana el día de la semana saldría desfasado.
+ZONA_HORARIA = ZoneInfo("America/Bogota")
+
+
+def _resolver_fecha_relativa(pregunta: str) -> str:
+    """Si la pregunta menciona un día relativo, le añade el día concreto como
+    contexto para que la búsqueda y la respuesta sepan a qué día se refiere."""
+    if not any(palabra in pregunta.lower() for palabra in PALABRAS_FECHA_RELATIVA):
+        return pregunta
+    hoy = datetime.datetime.now(ZONA_HORARIA).date()
+    dia_hoy = DIAS_SEMANA_ES[hoy.weekday()]
+    dia_manana = DIAS_SEMANA_ES[(hoy.weekday() + 1) % 7]
+    return f"{pregunta} (Contexto: hoy es {dia_hoy}, mañana es {dia_manana}.)"
+
+
 def nodo_contextualizar(state: AgentState) -> AgentState:
     """Reformula la pregunta usando el historial y reinicia info_por_rag_insuficiente
     (si no se resetea, un campo no reescrito en el turno actual conserva el valor
     persistido del turno anterior)."""
     historial = state.get("historial") or []
     if not historial:
-        return {"pregunta_efectiva": state["pregunta"], "info_por_rag_insuficiente": False}
+        base = state["pregunta"]
+    else:
+        texto_historial = "\n".join(
+            f"Usuario: {turno['pregunta']}\nAsistente: {turno['respuesta']}" for turno in historial
+        )
+        respuesta = llm.invoke(
+            [
+                SystemMessage(content=PROMPT_CONTEXTUALIZAR),
+                HumanMessage(
+                    content=f"Historial:\n{texto_historial}\n\nPregunta nueva: {state['pregunta']}"
+                ),
+            ]
+        )
+        base = respuesta.content.strip()
 
-    texto_historial = "\n".join(
-        f"Usuario: {turno['pregunta']}\nAsistente: {turno['respuesta']}" for turno in historial
-    )
-    respuesta = llm.invoke(
-        [
-            SystemMessage(content=PROMPT_CONTEXTUALIZAR),
-            HumanMessage(
-                content=f"Historial:\n{texto_historial}\n\nPregunta nueva: {state['pregunta']}"
-            ),
-        ]
-    )
     return {
-        "pregunta_efectiva": respuesta.content.strip(),
+        "pregunta_efectiva": _resolver_fecha_relativa(base),
         "info_por_rag_insuficiente": False,
     }
 
@@ -410,12 +442,19 @@ def nodo_auto_resolver(state: AgentState) -> AgentState:
 def nodo_pedir_info(state: AgentState) -> AgentState:
     """Mensaje distinto según el origen: RAG sin resultados vs. triaje ambiguo."""
     if state.get("info_por_rag_insuficiente"):
-        mensaje = "No encontré información específica sobre eso en nuestras políticas."
+        mensaje = (
+            "No encontré una respuesta específica a eso en nuestras políticas, pero "
+            "puede que solo necesite entender mejor tu pregunta. ¿Podrías reformularla "
+            "o darme un poco más de detalle? Por ejemplo, puedo ayudarte con domicilios, "
+            "promociones y descuentos, el Programa Cliente VidaPlus, cambios, reembolsos "
+            "y garantías, o el tratamiento de tus datos personales."
+        )
     else:
         mensaje = (
-            "Cuéntame en qué puedo ayudarte: domicilios, promociones y descuentos, el "
-            "Programa Cliente VidaPlus, cambios/reembolsos/garantías, o el tratamiento de "
-            "tus datos personales."
+            "Lo siento, no tengo información sobre ese tema. Con gusto puedo ayudarte con: "
+            "domicilios, promociones y descuentos, el Programa Cliente VidaPlus, cambios, "
+            "reembolsos y garantías, o el tratamiento de tus datos personales. "
+            "¿Sobre cuál te gustaría preguntar?"
         )
 
     return {

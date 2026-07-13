@@ -1,0 +1,5 @@
+# Tema de la app. Solo se define el color de acento (primaryColor) con el verde
+# corporativo de VidaPlus. NO se fijan backgroundColor / textColor a propósito:
+# así el usuario conserva el toggle claro/oscuro de Streamlit (Settings -> Theme).
+[theme]
+primaryColor = "#1f9d5c"
