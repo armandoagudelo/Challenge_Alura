@@ -222,9 +222,9 @@ with st.sidebar:
     st.divider()
     st.subheader("Documentos disponibles")
     for archivo in sorted(rag.CARPETA_DOCUMENTOS.glob("*.pdf")):
-        st.caption(archivo.name)
+        st.caption(archivo.stem)
     for nombre in st.session_state.get("archivos_agregados", []):
-        st.caption(f"{nombre} (agregado)")
+        st.caption(f"{Path(nombre).stem} (agregado)")
 
     st.divider()
     if st.button("Reiniciar conversación"):

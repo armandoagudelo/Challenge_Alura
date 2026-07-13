@@ -29,7 +29,11 @@ La interacción con el agente se realiza a través de una interfaz de chat web c
 - **Respuestas con efecto de escritura progresiva** (streaming).
 - **Canales de contacto** y un **modo desarrollador** (para inspeccionar el triaje y cargar documentos) en el menú lateral.
 
-![Interfaz del asistente Droguerías VidaPlus](src/img/interfaz.jpg)
+![Interfaz del asistente Droguerías VidaPlus](src/img/interfaz.png)
+
+Desde el **modo desarrollador** es posible ampliar la base de conocimiento cargando nuevos PDFs en caliente, sin reiniciar la aplicación. En el ejemplo, tras subir una guía de productos para mascotas, el agente pasa de no tener información sobre el tema a responder con base en el documento recién agregado:
+
+![Carga de documentos en caliente desde el modo desarrollador](src/img/CargaArchivos.png)
 
 ---
 
@@ -61,8 +65,6 @@ flowchart TD
 ---
 
 ## Arquitectura de la Solución
-
-> Esta sección se irá actualizando a medida que avance el proyecto.
 
 - **Triaje**: clasificación de intención con salida estructurada (Claude + `pydantic`), con reglas explícitas y ejemplos por categoría.
 - **RAG con calificación de relevancia**: los documentos se dividen en fragmentos, se indexan con embeddings locales (FAISS) y se recuperan por similitud; antes de generar la respuesta, un paso adicional evalúa si los fragmentos recuperados alcanzan para responder (en vez de inferirlo del texto de la respuesta generada).
